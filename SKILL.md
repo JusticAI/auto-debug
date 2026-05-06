@@ -310,7 +310,27 @@ cronjob(
 
 ## 集成指南
 
-### Chrome 扩展集成
+### Chrome 扩展集成（Manifest V3）
+
+**⚠️ 关键限制（MV3）：**
+- `chrome.downloads` 在 content script **不可用**，必须通过 service worker
+- `URL.createObjectURL` 在 service worker **不可用**（无 DOM），用 data URL
+- `const` 声明不挂到 `window`，跨文件访问用 `window.xxx`
+
+**架构：**
+```
+content.js (错误捕获)
+  → window.errorMonitor.captureError()
+  → saveErrors()
+  → chrome.runtime.sendMessage({ type: 'SAVE_ERROR_REPORT', reportData, filename })
+  ↓
+background.js (service worker)
+  → chrome.downloads.download({ url: dataUrl, filename })
+  ↓
+~/Downloads/auto-debug-errors-{project}.json
+  ↓
+cron (check_errors.py) → 指纹去重 → 新错误才报告
+```
 
 **步骤 1：添加错误监控**
 
@@ -324,52 +344,168 @@ cronjob(
       "js": ["error-monitor.js", "content.js"],
       "run_at": "document_idle"
     }
-  ]
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": ["downloads"]
 }
 ```
 
-**步骤 2：配置保存回调**
-
-在 `content.js` 中配置错误保存：
+**步骤 2：error-monitor.js（content script 中使用）**
 
 ```javascript
-// 初始化错误监控器
-const errorMonitor = new ErrorMonitor({
-    projectName: 'your-extension-name',
-    maxErrors: 100,
-    ignorePatterns: [
-        'kQuotaBytes',           // Chrome 存储限制
-        'Receiving end does not exist',  // 消息通道
-    ],
-    saveCallback: async (errors) => {
-        // 保存到 IndexedDB
-        if (typeof collectorDB !== 'undefined') {
-            const state = await collectorDB.loadState();
-            state.errorLog = errors;
-            await collectorDB.saveState(state);
-        }
-        
-        // 同时保存到文件（通过 downloads API）
-        const report = {
-            timestamp: new Date().toISOString(),
-            errors: errors.slice(-50),  // 最近50个
-            summary: errorMonitor.getErrorSummary()
+class ErrorMonitor {
+    constructor() {
+        this.errors = [];
+        this.fixedErrors = new Set();
+        this.maxErrors = 100;
+        this.projectName = 'your-project-name';
+        this.downloadFilename = `auto-debug-errors-${this.projectName}.json`;
+        this.setupInterceptors();
+    }
+
+    setupInterceptors() {
+        const originalError = console.error;
+        console.error = (...args) => {
+            this.captureError('console.error', args.join(' '));
+            originalError.apply(console, args);
         };
-        
-        const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-        
-        // 触发下载（保存到指定目录）
-        chrome.downloads.download({
-            url: url,
-            filename: `~/.hermes/auto-debug/your-project/errors-${Date.now()}.json`,
-            saveAs: false
+        window.addEventListener('error', (event) => {
+            this.captureError('uncaught', `${event.message} at ${event.filename}:${event.lineno}`);
+        });
+        window.addEventListener('unhandledrejection', (event) => {
+            this.captureError('unhandledrejection', event.reason?.toString() || 'Unknown');
         });
     }
+
+    captureError(type, message) {
+        if (this.shouldIgnore(message)) return;
+        const fingerprint = this.getFingerprint(type, message);
+        if (this.fixedErrors.has(fingerprint)) return;
+        this.errors.push({
+            type, message: message.substring(0, 500),
+            timestamp: new Date().toISOString(),
+            url: window.location.href, fingerprint
+        });
+        if (this.errors.length > this.maxErrors) this.errors = this.errors.slice(-this.maxErrors);
+        this.saveErrors();
+    }
+
+    getFingerprint(type, message) {
+        const simplified = message
+            .replace(/:\d+:\d+/g, '')
+            .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/g, '')
+            .substring(0, 200);
+        let hash = 0;
+        for (let i = 0; i < simplified.length; i++) {
+            hash = ((hash << 5) - hash) + simplified.charCodeAt(i);
+            hash = hash & hash;
+        }
+        return `${type}_${Math.abs(hash).toString(36)}`;
+    }
+
+    shouldIgnore(message) {
+        return ['kQuotaBytes', 'Receiving end does not exist', 'message port closed']
+            .some(p => message.includes(p));
+    }
+
+    async saveErrors() {
+        try {
+            // 保存到 IndexedDB（如果可用）
+            if (typeof yourDB !== 'undefined' && yourDB.db) {
+                const state = await yourDB.loadState();
+                state.errorLog = this.errors;
+                await yourDB.saveState(state);
+            }
+
+            if (this.errors.length === 0) return;
+            const uniqueErrors = [];
+            const seen = new Set();
+            for (const error of this.errors) {
+                const fp = error.fingerprint || this.getFingerprint(error.type, error.message);
+                if (!seen.has(fp) && !this.fixedErrors.has(fp)) {
+                    seen.add(fp);
+                    uniqueErrors.push(error);
+                }
+            }
+            if (uniqueErrors.length === 0) return;
+
+            const report = {
+                project: this.projectName,
+                timestamp: new Date().toISOString(),
+                errors: uniqueErrors.slice(-20),
+                summary: { total: this.errors.length, unique: uniqueErrors.length }
+            };
+
+            // ✅ 通过 background.js 保存（content script 不能直接用 chrome.downloads）
+            if (typeof chrome !== 'undefined' && chrome.runtime) {
+                chrome.runtime.sendMessage({
+                    type: 'SAVE_ERROR_REPORT',
+                    reportData: report,
+                    filename: this.downloadFilename
+                }, (response) => {
+                    if (chrome.runtime.lastError) {
+                        console.error(`[AutoDebug] 保存失败: ${chrome.runtime.lastError.message}`);
+                    }
+                });
+            }
+        } catch (e) { /* 忽略保存错误 */ }
+    }
+
+    markAsFixed(fingerprint) {
+        this.fixedErrors.add(fingerprint);
+    }
+}
+
+// ✅ 用 window 确保跨文件可访问（const 不行）
+try { window.errorMonitor = new ErrorMonitor(); }
+catch (e) { window.errorMonitor = null; }
+```
+
+**步骤 3：background.js（service worker 中添加下载处理）**
+
+```javascript
+// 监听 content script 的错误报告保存请求
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.type === 'SAVE_ERROR_REPORT') {
+        const { reportData, filename } = message;
+        // ✅ service worker 用 data URL（不能用 URL.createObjectURL）
+        const jsonStr = JSON.stringify(reportData, null, 2);
+        const dataUrl = 'data:application/json;base64,' + btoa(unescape(encodeURIComponent(jsonStr)));
+        chrome.downloads.download({
+            url: dataUrl,
+            filename: filename,
+            saveAs: false,
+            conflictAction: 'overwrite'
+        }, (downloadId) => {
+            if (chrome.runtime.lastError) {
+                sendResponse({ success: false, error: chrome.runtime.lastError.message });
+            } else {
+                sendResponse({ success: true, downloadId });
+            }
+        });
+        return true; // 保持 sendResponse 通道开放
+    }
+    return false;
 });
 ```
 
-**步骤 3：添加自动恢复逻辑**
+**步骤 4：在采集代码中调用 errorMonitor**
+
+```javascript
+// 当捕获到错误时，显式通知 errorMonitor
+try {
+    const result = await doSomething();
+} catch (e) {
+    // 你的错误处理逻辑
+    state.errors.push({ name, error: e.message });
+    // ✅ 通知 errorMonitor 触发文件保存
+    if (window.errorMonitor) {
+        window.errorMonitor.captureError('my_error', `${name}: ${e.message}`);
+    }
+}
+```
 
 ```javascript
 // 连续错误检测
@@ -649,57 +785,77 @@ class ErrorMonitor {
 
 ### Python 端（check_errors.py）
 
-```python
-ANALYZED_FILE = "analyzed_errors.json"
+`check_errors.py` 支持：
+- 检查 `~/.hermes/auto-debug/{project}/` 目录
+- 检查 `~/Downloads/auto-debug-errors-{project}.json`（Chrome 扩展输出）
+- 指纹去重：同一类错误只报告一次
+- 分析后自动删除 Downloads 文件
 
-def load_analyzed_errors(error_dir):
+```python
+ANALYZED_FILE = "analyzed_fingerprints.json"
+DOWNLOADS_DIR = Path.home() / "Downloads"
+
+def load_analyzed_fingerprints(project_name):
     """加载已分析的指纹"""
-    path = Path(error_dir) / ANALYZED_FILE
+    path = Path(f"~/.hermes/auto-debug/{project_name}") / ANALYZED_FILE
     if path.exists():
         return set(json.loads(path.read_text()).get("fingerprints", []))
     return set()
 
+def save_analyzed_fingerprints(project_name, fingerprints):
+    """保存已分析的指纹（最多500个）"""
+    path = Path(f"~/.hermes/auto-debug/{project_name}") / ANALYZED_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"fingerprints": sorted(fingerprints)[-500:]}, indent=2))
+
 def check_errors(error_dir, project_name):
-    analyzed = load_analyzed_errors(error_dir)
-    new_errors = []
-    
-    for error in all_errors:
-        fp = error.get("fingerprint", "")
-        if fp and fp in analyzed:
-            continue  # 跳过已分析
-        new_errors.append(error)
-    
-    # 保存新分析的指纹
-    for error in new_errors:
-        analyzed.add(error.get("fingerprint", ""))
-    save_analyzed_errors(error_dir, analyzed)
-    
-    return {"has_errors": bool(new_errors), "errors": new_errors}
-```
+    analyzed = load_analyzed_fingerprints(project_name)
+    downloads_file = DOWNLOADS_DIR / f"auto-debug-errors-{project_name}.json"
 
-### 修复后标记
+    # 收集所有错误（从 error_dir 和 Downloads）
+    all_errors = collect_from_dir(error_dir) + collect_from_file(downloads_file)
 
-LLM 修复 bug 后，通过 message handler 标记为已修复：
-```javascript
-chrome.tabs.sendMessage(tab.id, {
-    type: 'MARK_ERROR_FIXED',
-    fingerprint: error.fingerprint
-});
+    # 指纹去重
+    new_errors = [e for e in all_errors if e.get("fingerprint", "") not in analyzed]
+    if not new_errors:
+        if downloads_file.exists(): downloads_file.unlink()  # 清理
+        return {"has_errors": False, "message": "全部已分析"}
+
+    # 保存指纹 + 删除 Downloads 文件
+    new_fps = {e["fingerprint"] for e in new_errors if e.get("fingerprint")}
+    save_analyzed_fingerprints(project_name, analyzed | new_fps)
+    if downloads_file.exists(): downloads_file.unlink()
+
+    return {"has_errors": True, "errors": new_errors[:20]}
 ```
 
 **Token 节省：** 同一错误 × 100 次 = 3,000 tokens（而非 300,000）
 
+## Downloads 文件自动清理
+
+cron 脚本分析完错误后自动删除 `~/Downloads/auto-debug-errors-*.json`：
+- 有新错误 → 报告 + 保存指纹 + 删除文件
+- 全部已分析 → `has_errors: false` + 删除文件
+- 文件只在错误发生到下次 cron 检查之间存在（最多 10 分钟）
+
 ## 故障排除
 
 **问题：错误文件没有生成**
-- 检查目录权限
-- 确认 saveCallback 正确配置
+- 确认 `error-monitor.js` 中使用 `window.errorMonitor`（不是 `const`）
+- 确认通过 `chrome.runtime.sendMessage` 发送给 `background.js`（content script 不能直接用 `chrome.downloads`）
+- 确认 `background.js` 使用 data URL（service worker 不能用 `URL.createObjectURL`）
 - 检查浏览器控制台是否有报错
 
 **问题：Python 脚本找不到错误文件**
 - 确认错误目录路径正确
+- 同时检查 `~/Downloads/auto-debug-errors-{project}.json`
 - 检查文件扩展名是否为 `.json`
 - 确认文件修改时间在检查范围内
+
+**问题：同一错误被重复分析**
+- 确认 `check_errors.py` 使用指纹去重（`analyzed_fingerprints.json`）
+- 检查错误的 `fingerprint` 字段是否存在
+- 指纹文件最多保留 500 个，旧的自动淘汰
 
 **问题：自动修复失败**
 - 检查文件权限
@@ -714,6 +870,6 @@ chrome.tabs.sendMessage(tab.id, {
 
 ---
 
-**最后更新：** 2026-05-05
-**版本：** 1.0.0
+**最后更新：** 2026-05-06
+**版本：** 1.1.0
 **作者：** Hermes Agent

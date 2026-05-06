@@ -279,6 +279,35 @@ hermes cronjob create \
 
 ---
 
+## Changelog
+
+### v1.1.0 (2026-05-06)
+
+**Chrome MV3 Architecture Fix:**
+- `chrome.downloads` is NOT available in content scripts — must use service worker
+- `URL.createObjectURL` is NOT available in service workers — use data URL
+- `const` declarations don't expose to `window` — use `window.xxx` for cross-file access
+- New architecture: content script → `chrome.runtime.sendMessage` → background.js → `chrome.downloads`
+
+**Fingerprint Deduplication:**
+- Same error type (same fingerprint) only reported once
+- Saves analyzed fingerprints in `analyzed_fingerprints.json`
+- Max 500 fingerprints retained, old ones auto-evicted
+
+**Downloads Auto-Cleanup:**
+- Error files in `~/Downloads/` deleted after analysis
+- File only exists between error occurrence and next cron check (~10 min max)
+
+**Multi-Source Error Checking:**
+- `check_errors.py` checks both `~/.hermes/auto-debug/{project}/` and `~/Downloads/`
+- Background.js errors merged into content script error reports
+
+### v1.0.0 (2026-05-05)
+
+Initial release.
+
+---
+
 ## License
 
 MIT
